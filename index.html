@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>声のスペクトル解析ツール</title>
+<style>
+  :root{
+    --bg:#faf9f6;
+    --surface:#ffffff;
+    --border:#e5e2da;
+    --text-primary:#1f1e1c;
+    --text-secondary:#6b6862;
+    --text-muted:#9a978f;
+    --accent:#D4537E;
+    --accent-dark:#993556;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#171614;
+      --surface:#211f1c;
+      --border:#39362f;
+      --text-primary:#f2f0ea;
+      --text-secondary:#b8b5ab;
+      --text-muted:#847f74;
+      --accent:#ED93B1;
+      --accent-dark:#F4C0D1;
+    }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--text-primary);
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic",sans-serif;
+    padding:24px 16px 48px;
+  }
+  .wrap{max-width:520px;margin:0 auto;}
+  h1{font-size:19px;font-weight:500;margin:0 0 4px;}
+  .sub{font-size:13px;color:var(--text-secondary);margin:0 0 24px;line-height:1.6;}
+  .btn-row{display:flex;justify-content:center;margin-bottom:16px;}
+  button{
+    font-family:inherit;font-size:15px;font-weight:500;
+    padding:12px 24px;border-radius:10px;border:0.5px solid var(--border);
+    background:var(--surface);color:var(--text-primary);
+    display:flex;align-items:center;gap:8px;cursor:pointer;
+  }
+  button:active{transform:scale(0.98);}
+  #statusMsg{text-align:center;font-size:13px;color:var(--text-secondary);min-height:18px;margin:0 0 16px;}
+  .spectrum-box{
+    position:relative;height:180px;background:var(--surface);
+    border:0.5px solid var(--border);border-radius:12px;overflow:hidden;
+  }
+  .legend{
+    position:absolute;top:8px;right:10px;font-size:11px;color:var(--text-muted);
+    display:flex;align-items:center;gap:5px;
+  }
+  .legend .dot{width:8px;height:8px;border-radius:2px;background:var(--accent);display:inline-block;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0;}
+  .card{background:var(--surface);border:0.5px solid var(--border);border-radius:12px;padding:16px;}
+  .card p.label{font-size:13px;color:var(--text-secondary);margin:0 0 4px;}
+  .card p.value{font-size:24px;font-weight:500;margin:0;}
+  .note{font-size:12px;color:var(--text-muted);line-height:1.6;margin:8px 0 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>声のスペクトル解析ツール</h1>
+  <p class="sub">マイクの音声をリアルタイムで解析し、基音・シンガーズフォルマント・倍音の明瞭度・ビブラートを可視化します。「あー」など母音を数秒伸ばすと数値が安定します。</p>
+
+  <div class="btn-row">
+    <button id="toggleBtn">
+      <span id="toggleLabel">マイクを開始</span>
+    </button>
+  </div>
+  <p id="statusMsg"></p>
+
+  <div class="spectrum-box">
+    <canvas id="spectrum" style="width:100%;height:100%;display:block;"></canvas>
+    <div class="legend"><span class="dot"></span>シンガーズフォルマント帯 (2.5〜3.5kHz)</div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><p class="label">基音</p><p class="value" id="f0Val">--</p></div>
+    <div class="card"><p class="label">シンガーズフォルマント</p><p class="value" id="formantVal">--</p></div>
+    <div class="card"><p class="label">倍音の明瞭度</p><p class="value" id="clarityVal">--</p></div>
+    <div class="card"><p class="label">ビブラート</p><p class="value" id="vibratoVal">--</p></div>
+  </div>
+
+  <p class="note">数値は発声の効率・響きの可視化であり、音楽的な表現力までは評価しません。HTTPS環境（またはlocalhost）でのみマイクが動作します。</p>
+</div>
+
+<script>
+(function(){
+  const btn = document.getElementById('toggleBtn');
+  const label = document.getElementById('toggleLabel');
+  const status = document.getElementById('statusMsg');
+  const canvas = document.getElementById('spectrum');
+  const ctx = canvas.getContext('2d');
+  const f0El = document.getElementById('f0Val');
+  const formantEl = document.getElementById('formantVal');
+  const clarityEl = document.getElementById('clarityVal');
+  const vibratoEl = document.getElementById('vibratoVal');
+
+  let audioCtx, analyser, source, stream, rafId;
+  let running = false;
+  const pitchHistory = [];
+  const MAX_HISTORY = 120;
+
+  function resizeCanvas(){
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * devicePixelRatio;
+    canvas.height = rect.height * devicePixelRatio;
+  }
+  window.addEventListener('resize', resizeCanvas);
+
+  function freqToNote(freq){
+    if(!freq || freq <= 0) return '--';
+    const A4 = 440;
+    const noteNames = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const midi = Math.round(12 * Math.log2(freq / A4) + 69);
+    const name = noteNames[(midi % 12 + 12) % 12];
+    const octave = Math.floor(midi / 12) - 1;
+    return name + octave;
+  }
+
+  function autoCorrelate(buf, sampleRate){
+    const SIZE = buf.length;
+    let rms = 0;
+    for(let i=0;i<SIZE;i++) rms += buf[i]*buf[i];
+    rms = Math.sqrt(rms/SIZE);
+    if(rms < 0.01) return -1;
+
+    let r1=0, r2=SIZE-1, thres=0.2;
+    for(let i=0;i<SIZE/2;i++){ if(Math.abs(buf[i])<thres){ r1=i; break; } }
+    for(let i=1;i<SIZE/2;i++){ if(Math.abs(buf[SIZE-i])<thres){ r2=SIZE-i; break; } }
+    const trimmed = buf.slice(r1, r2);
+    const newSize = trimmed.length;
+    const c = new Array(newSize).fill(0);
+    for(let lag=0; lag<newSize; lag++){
+      for(let i=0; i<newSize-lag; i++){ c[lag] += trimmed[i]*trimmed[i+lag]; }
+    }
+    let d=0; while(d < newSize-1 && c[d] > c[d+1]) d++;
+    let maxval=-1, maxpos=-1;
+    for(let i=d;i<newSize;i++){ if(c[i]>maxval){ maxval=c[i]; maxpos=i; } }
+    let T0 = maxpos;
+    if(T0 <= 0) return -1;
+    const x1=c[T0-1]||c[T0], x2=c[T0], x3=c[T0+1]||c[T0];
+    const a=(x1+x3-2*x2)/2, b=(x3-x1)/2;
+    if(a) T0 = T0 - b/(2*a);
+    return sampleRate/T0;
+  }
+
+  function computeFormantScore(freqData, sampleRate, fftSize){
+    const nyquist = sampleRate/2;
+    const binHz = nyquist / (fftSize/2);
+    const bandLo = Math.floor(2500/binHz);
+    const bandHi = Math.ceil(3500/binHz);
+    let bandEnergy=0, totalEnergy=0;
+    for(let i=0;i<freqData.length;i++){
+      const v = Math.pow(10, freqData[i]/20);
+      totalEnergy += v;
+      if(i>=bandLo && i<=bandHi) bandEnergy += v;
+    }
+    if(totalEnergy<=0) return 0;
+    const ratio = bandEnergy/totalEnergy;
+    const score = Math.min(100, Math.round(ratio * 100 * 6));
+    return score;
+  }
+
+  function computeClarity(freqData, f0, sampleRate, fftSize){
+    if(f0<=0) return 0;
+    const nyquist = sampleRate/2;
+    const binHz = nyquist/(fftSize/2);
+    let harmonicEnergy=0, totalEnergy=0;
+    for(let i=0;i<freqData.length;i++){
+      totalEnergy += Math.pow(10, freqData[i]/20);
+    }
+    for(let h=1; h<=10; h++){
+      const freq = f0*h;
+      if(freq > nyquist) break;
+      const bin = Math.round(freq/binHz);
+      for(let off=-1; off<=1; off++){
+        const idx = bin+off;
+        if(idx>=0 && idx<freqData.length) harmonicEnergy += Math.pow(10, freqData[idx]/20);
+      }
+    }
+    if(totalEnergy<=0) return 0;
+    return Math.min(100, Math.round((harmonicEnergy/totalEnergy)*100*3));
+  }
+
+  function computeVibrato(){
+    const recent = pitchHistory.slice(-60).filter(v=>v>0);
+    if(recent.length < 30) return null;
+    let peaks=0;
+    for(let i=1;i<recent.length-1;i++){
+      if(recent[i]>recent[i-1] && recent[i]>recent[i+1]) peaks++;
+    }
+    const durationSec = recent.length * (1024/audioCtx.sampleRate);
+    const rate = peaks / durationSec;
+    const max = Math.max(...recent), min = Math.min(...recent);
+    const depthCents = 1200 * Math.log2(max/min) / 2;
+    if(rate < 3 || rate > 8 || depthCents < 15) return {rate: rate, depth: depthCents, stable:false};
+    return {rate: rate, depth: depthCents, stable:true};
+  }
+
+  function draw(){
+    const bufferLength = analyser.frequencyBinCount;
+    const freqData = new Uint8Array(bufferLength);
+    const floatData = new Float32Array(bufferLength);
+    analyser.getByteFrequencyData(freqData);
+    analyser.getFloatFrequencyData(floatData);
+    const timeData = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(timeData);
+
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    const sampleRate = audioCtx.sampleRate;
+    const nyquist = sampleRate/2;
+    const maxFreq = 5000;
+    const binHz = nyquist/bufferLength;
+    const barsCount = Math.floor(maxFreq/binHz);
+    const barWidth = w/barsCount;
+
+    const formantLo = Math.floor(2500/binHz), formantHi = Math.ceil(3500/binHz);
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const mutedColor = isDark ? '#847f74' : '#9a978f';
+    const accentColor = isDark ? '#ED93B1' : '#D4537E';
+    for(let i=0;i<barsCount;i++){
+      const val = freqData[i]/255;
+      const barH = val*h;
+      const inFormant = i>=formantLo && i<=formantHi;
+      ctx.fillStyle = inFormant ? accentColor : mutedColor;
+      ctx.globalAlpha = inFormant ? 0.9 : 0.55;
+      ctx.fillRect(i*barWidth, h-barH, Math.max(1,barWidth-1), barH);
+    }
+    ctx.globalAlpha = 1;
+
+    const f0 = autoCorrelate(timeData, sampleRate);
+    if(f0 > 60 && f0 < 1200){
+      pitchHistory.push(f0);
+      if(pitchHistory.length>MAX_HISTORY) pitchHistory.shift();
+      f0El.textContent = Math.round(f0) + ' Hz (' + freqToNote(f0) + ')';
+      const formantScore = computeFormantScore(floatData, sampleRate, analyser.fftSize);
+      formantEl.textContent = formantScore + '%';
+      const clarity = computeClarity(floatData, f0, sampleRate, analyser.fftSize);
+      clarityEl.textContent = clarity + '%';
+    } else {
+      pitchHistory.push(0);
+      if(pitchHistory.length>MAX_HISTORY) pitchHistory.shift();
+      f0El.textContent = '--';
+      formantEl.textContent = '--';
+      clarityEl.textContent = '--';
+    }
+
+    const vib = computeVibrato();
+    if(vib && vib.stable){
+      vibratoEl.textContent = vib.rate.toFixed(1) + 'Hz / ' + Math.round(vib.depth) + 'セント';
+    } else if(vib){
+      vibratoEl.textContent = '不安定';
+    } else {
+      vibratoEl.textContent = '検出中…';
+    }
+
+    rafId = requestAnimationFrame(draw);
+  }
+
+  async function start(){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      status.textContent = 'このブラウザ・接続ではマイクが使えません（HTTPS環境が必要です）。';
+      return;
+    }
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    } catch(e){
+      status.textContent = 'マイクへのアクセスが許可されませんでした。';
+      return;
+    }
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.4;
+    source.connect(analyser);
+    resizeCanvas();
+    running = true;
+    label.textContent = '停止する';
+    status.textContent = '「あー」などの母音を伸ばして声を出してみてください。';
+    pitchHistory.length = 0;
+    draw();
+  }
+
+  function stop(){
+    running = false;
+    if(rafId) cancelAnimationFrame(rafId);
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    if(audioCtx) audioCtx.close();
+    label.textContent = 'マイクを開始';
+    status.textContent = '';
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
+
+  btn.addEventListener('click', function(){
+    if(running) stop(); else start();
+  });
+
+  resizeCanvas();
+})();
+</script>
+</body>
+</html>
